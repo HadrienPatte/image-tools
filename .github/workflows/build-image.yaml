@@ -1,0 +1,212 @@
+name: Build image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image-metadata:
+    name: metadata
+    runs-on: ubuntu-26.04
+    outputs:
+      BUILD: ${{ steps.image-metadata.outputs.BUILD }}
+      PUSH: ${{ steps.image-metadata.outputs.PUSH }}
+      TEST: ${{ steps.image-metadata.outputs.TEST }}
+      IMAGE_NAME: ${{ steps.image-metadata.outputs.IMAGE_NAME }}
+      IMAGE_REF: ${{ steps.image-metadata.outputs.IMAGE_REF }}
+      IMAGE_TAG: ${{ steps.image-metadata.outputs.IMAGE_TAG }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # Logged in on every event (not only push) so the existence check below
+      # can see private packages; GITHUB_TOKEN on PRs only has read access.
+      - name: Login to Github container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Gather image metadata
+        id: image-metadata
+        env:
+          IMAGE: ${{ inputs.image }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euxo pipefail
+
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            echo "PUSH=true" >> $GITHUB_OUTPUT
+          else
+            echo "PUSH=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [[ -d "images/${IMAGE}/test" ]]; then
+            echo "TEST=true" >> $GITHUB_OUTPUT
+          else
+            echo "TEST=false" >> $GITHUB_OUTPUT
+          fi
+
+          IMAGE_TAG=$(scripts/make-image-tag.sh "images/${IMAGE}")
+
+          # Map image directory name to image name
+          case "${IMAGE}" in
+            bpftool) IMAGE_NAME="cilium-bpftool" ;;
+            checkpatch) IMAGE_NAME="cilium-checkpatch" ;;
+            compilers) IMAGE_NAME="image-compilers" ;;
+            iptables) IMAGE_NAME="iptables" ;;
+            llvm) IMAGE_NAME="cilium-llvm" ;;
+            maker) IMAGE_NAME="image-maker" ;;
+            network-perf) IMAGE_NAME="network-perf" ;;
+            startup-script) IMAGE_NAME="startup-script" ;;
+            tester) IMAGE_NAME="image-tester" ;;
+            *) IMAGE_NAME="${IMAGE}" ;;
+          esac
+          IMAGE_REF="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+
+          # Check if image exists in registry
+          if docker buildx imagetools inspect "${IMAGE_REF}:${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "Image ${IMAGE_REF}:${IMAGE_TAG} already exists in registry"
+            echo "BUILD=false" >> $GITHUB_OUTPUT
+          else
+            echo "Will build ${IMAGE_REF}:${IMAGE_TAG} as it's not present in registry"
+            echo "BUILD=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "IMAGE_REF=${IMAGE_REF}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+          cat $GITHUB_OUTPUT
+
+  build-platform:
+    name: linux/${{ matrix.platform }} platform
+    runs-on: ubuntu-26.04${{ matrix.platform == 'arm64' && '-arm' || '' }}
+    needs: image-metadata
+    if: needs.image-metadata.outputs.BUILD == 'true'
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64]
+    env:
+      IMAGE_REF: ${{ needs.image-metadata.outputs.IMAGE_REF }}
+      # renovate: datasource=github-releases depName=google/go-containerregistry
+      CRANE_VERSION: v0.22.1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Test ${{ inputs.image }} linux/${{ matrix.platform }} image
+        if: needs.image-metadata.outputs.TEST == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: images/${{ inputs.image }}
+          file: images/${{ inputs.image }}/Dockerfile
+          platforms: linux/${{ matrix.platform }}
+          provenance: false
+          push: false
+          target: test
+      - name: Build ${{ inputs.image }} linux/${{ matrix.platform }} image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: images/${{ inputs.image }}
+          file: images/${{ inputs.image }}/Dockerfile
+          platforms: linux/${{ matrix.platform }}
+          provenance: false
+          push: false
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=${{ needs.image-metadata.outputs.IMAGE_NAME }}
+            org.opencontainers.image.version=${{ needs.image-metadata.outputs.IMAGE_TAG }}
+          outputs: type=oci,dest=${{ runner.temp }}/oci,tar=false
+      - name: Login to Github container registry
+        if: needs.image-metadata.outputs.PUSH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up crane
+        if: needs.image-metadata.outputs.PUSH == 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euxo pipefail
+
+          ARCH=${{ matrix.platform == 'amd64' && 'x86_64' || 'arm64' }}
+          ARCHIVE="go-containerregistry_Linux_${ARCH}.tar.gz"
+          BASE_URL="https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}"
+
+          curl --fail --location --silent --show-error \
+            --remote-name "${BASE_URL}/${ARCHIVE}" \
+            --remote-name "${BASE_URL}/checksums.txt"
+          grep " ${ARCHIVE}\$" checksums.txt | sha256sum --check -
+
+          sudo tar --extract --gzip --file "${ARCHIVE}" --directory /usr/local/bin crane
+          crane version
+      - name: Push ${{ inputs.image }} linux/${{ matrix.platform }} image by digest
+        if: needs.image-metadata.outputs.PUSH == 'true'
+        run: |
+          set -euxo pipefail
+
+          DIGEST=$(jq -r '.manifests[0].digest' "${{ runner.temp }}/oci/index.json")
+          crane push "${{ runner.temp }}/oci" "${IMAGE_REF}@${DIGEST}"
+
+          mkdir -p "${{ runner.temp }}/digests"
+          touch "${{ runner.temp }}/digests/${DIGEST#sha256:}"
+      - name: Upload digest
+        if: needs.image-metadata.outputs.PUSH == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ inputs.image }}-${{ matrix.platform }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-multi-platform:
+    name: multi-platform
+    runs-on: ubuntu-26.04
+    if: needs.image-metadata.outputs.BUILD == 'true' && needs.image-metadata.outputs.PUSH == 'true'
+    needs:
+      - image-metadata
+      - build-platform
+    env:
+      IMAGE_REF: ${{ needs.image-metadata.outputs.IMAGE_REF }}
+      IMAGE_TAG: ${{ needs.image-metadata.outputs.IMAGE_TAG }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ inputs.image }}-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Login to Github container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create and push multi-platform image
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euxo pipefail
+
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --tag "${IMAGE_REF}:${IMAGE_TAG}" \
+            $(printf "${IMAGE_REF}@sha256:%s " *)
+      - name: Inspect multi-platform image
+        run: docker buildx imagetools inspect "${IMAGE_REF}:${IMAGE_TAG}"
